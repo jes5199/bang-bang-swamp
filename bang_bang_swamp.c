@@ -1,6 +1,9 @@
-#define eepromVersion 2
+#define eepromVersion 11
 
+#define waterLevelPin A1
+#define waterLevelCalibrationPin A2
 #define buttonPin A3
+
 #define refillPumpPin 3
 #define bilgePumpPin 5
 #define blowerPin 6
@@ -29,30 +32,31 @@
 #define uiTimeout 5000
 #define displayTimeout 5000
 
-#define maxSetting 20
-
-#define extraWaterEstimateSetting 0
+#define waterLevelsSetting 0
 #define blowerSpeedSetting 1
 #define targetTemperatureSetting 2
 #define targetHumiditySetting 3
-#define extraSettingsSetting 4
 
-#define minReservoirLevelSetting 5
-#define maxReservoirLevelSetting 6
-#define bilgePumpRunTimeSetting 7
-#define bilgePumpWaitTimeSetting 8
-#define temperatureSwingSetting 9
-#define humiditySwingSetting 10
-#define maxHumiditySetting 11
-#define maxHumiditySwingSetting 12
-#define blowerLowSpeedSetting 13
-#define blowerLowRunTimeSetting 14
-#define blowerLowWaitTimeSetting 15
-#define refillPumpPwmSetting 16
-#define refillPumpTimePerTenthOfAnInchSetting 17
-#define factoryResetSetting 18
+#define extraSettingsSetting  4
+#define extraSettingsSetting2 5
+#define extraSettingsSetting3 6
+#define extraSettingsSetting4 7
 
-// TODO: experiment with these
+#define minReservoirLevelSetting 8
+#define maxReservoirLevelSetting 9
+#define currentReservoirLevelSetting 10
+#define bilgePumpRunTimeSetting 11
+#define bilgePumpWaitTimeSetting 12
+#define overheatSetting 13
+#define temperatureSwingSetting 14
+#define humiditySwingSetting 15
+#define maxHumiditySetting 16
+#define maxHumiditySwingSetting 17
+#define refillPumpTimePerGallonSetting 18
+#define factoryResetSetting 30
+
+#define maxSetting 32
+
 #define blowerSpeedStep 5
 #define minBlowerSpeed 0
 #define maxBlowerSpeed 255
@@ -74,6 +78,15 @@
 #define fanAnimatationDelay 100
 #define alertAnimationDelay 500
 
+#define waterLevelReadingCount 11
+#define waterSeriesResistorValue 580
+#define waterOneInchResistanceRatio 0.95
+#define waterCalibrationInchRatio 0.63
+#define waterCalibrationInch 7
+
+#define maxReservoirLevel 120
+#define minReservoirLevel 10
+
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include <stdbool.h>
@@ -94,6 +107,12 @@ Adafruit_NeoPixel strip = Adafruit_NeoPixel(pixelCount, pixelPin, NEO_GRBW + NEO
 struct SensorData {
   int temperature;
   int humidity;
+};
+
+struct SwampWater {
+  int readingCount;
+  int readingIndex;
+  float readings[waterLevelReadingCount];
 };
 
 struct SwampData {
@@ -124,6 +143,7 @@ struct SwampUI {
 struct SwampSettings {
   int target_temperature;
   int temperature_swing;
+  int overheat;
 
   int max_humidity;
   int max_humidity_swing;
@@ -133,28 +153,26 @@ struct SwampSettings {
 
   int estimated_extra_water;
 
-  uint8_t blower_high_pwm;
-  //int blower_high_run_time;
-  //int blower_high_wait_time;
-
-  uint8_t blower_low_pwm;
-  int blower_low_run_time;
-  int blower_low_wait_time;
+  uint8_t blower_pwm;
 
   int bilge_pump_run_time;
   int bilge_pump_wait_time;
 
   int min_reservoir_level;
   int max_reservoir_level;
+  int reservoir_level_swing;
 
-  int refill_pump_pwm;
-  int refill_pump_time_per_tenth_of_an_inch;
+  int water_level_calibrate_tenths_of_inches;
+  float water_level_calibrate_ratio;
+
+  int refill_pump_time_per_gallon;
 };
 
 enum Temperature {
   COLD,
   COOL,
-  HOT
+  HOT,
+  OVERHEATED
 };
 
 enum Humidity {
@@ -164,6 +182,7 @@ enum Humidity {
 
 enum WaterLevel {
   LOW_WATER,
+  ENOUGH_WATER,
   HIGH_WATER
 };
 
@@ -177,12 +196,12 @@ struct SwampSense {
   struct Sensor inside;
   struct Sensor blower;
   enum WaterLevel reservoir;
+  bool can_refill;
 };
 
 enum Power {
   OFF,
   ON,
-  SLOW
 };
 
 struct Animation {
@@ -192,13 +211,17 @@ struct Animation {
   unsigned long int color2;
 };
 
-#define RED     0x1000
-#define BLUE    0x0010
-#define YELLOW  0x1100
-#define GREEN   0x0100
-#define MAGENTA 0x1010
-#define GREY    0x0001
-#define WHITE   0x1110
+#define RED       0x1000
+#define PINK      0x1001
+#define BLUE      0x0010
+#define BABYBLUE  0x0011
+#define CYAN      0x0110
+#define LIGHTCYAN 0x0111
+#define YELLOW    0x1100
+#define GREEN     0x0100
+#define MAGENTA   0x1010
+#define GREY      0x0001
+#define WHITE     0x1110
 
 struct SwampAction {
   enum Power blower_fan;
@@ -212,14 +235,10 @@ struct SwampButtons {
 };
 
 struct SwampTimers {
-  unsigned long blower_start_time;
-  unsigned long blower_stop_time;
-
   unsigned long bilge_pump_start_time;
   unsigned long bilge_pump_stop_time;
 
-  unsigned long refill_run_time;
-  unsigned long refill_stop_time;
+  unsigned long refill_start_time;
 };
 
 #ifdef __EMSCRIPTEN__
@@ -348,13 +367,58 @@ void doI2cReadStep(struct SwampI2C *i2c, struct SwampData *data) {
   }
 }
 
-void readWaterLevel(struct SwampData *data) {
-  // TODO
+float readWaterPinRatio() {
+  int w_analog = analogRead(waterLevelPin);
+  int c_analog = analogRead(waterLevelCalibrationPin);
+  float w_resistance = waterSeriesResistorValue / ((1023.0 / w_analog) - 1.0);
+  float c_resistance = waterSeriesResistorValue / ((1023.0 / c_analog) - 1.0);
+
+  //Serial.print("W: "); Serial.println(w_resistance);
+  //Serial.print("C: "); Serial.println(c_resistance);
+  float ratio = w_resistance / c_resistance;
+  return ratio;
 }
 
-void readSensors(struct SwampI2C *i2c, struct SwampData *data) {
+float readWaterPin(struct SwampSettings settings) {
+  float ratio = readWaterPinRatio();
+  float inches = (10 +
+                      (settings.water_level_calibrate_tenths_of_inches-10) * (ratio - waterOneInchResistanceRatio)
+                    / (settings.water_level_calibrate_ratio - waterOneInchResistanceRatio)
+                 ) / 10;
+  //Serial.print(inches); Serial.println(" inch");
+  return inches;
+}
+
+void readWaterLevel(struct SwampWater *water, struct SwampData *data, struct SwampSettings settings) {
+  float value = readWaterPin(settings);
+  water->readings[water->readingIndex] = value;
+  water->readingIndex += 1;
+  water->readingIndex %= waterLevelReadingCount;
+  if(water->readingCount < waterLevelReadingCount) { water->readingCount += 1; }
+
+  float sortedReadings[waterLevelReadingCount];
+  for(int i = 0; i < water->readingCount; i++) { sortedReadings[i] = water->readings[i]; }
+  for(int i = 0; i < water->readingCount; i++) {
+    for(int j = i+1; j < water->readingCount; j++) {
+      if(sortedReadings[i] > sortedReadings[j]) {
+        float tmp = sortedReadings[i];
+        sortedReadings[i] = sortedReadings[j];
+        sortedReadings[j] = tmp;
+      }
+    }
+  }
+
+  float meanReading = sortedReadings[water->readingCount / 2];
+  int readingInTenths = (meanReading + 0.5) * 10;
+  //Serial.print(meanReading); Serial.println(" inch");
+
+  data->reservoir = readingInTenths;
+  //Serial.println(data->reservoir);
+}
+
+void readSensors(struct SwampI2C *i2c, struct SwampData *data, struct SwampWater *water, struct SwampSettings settings) {
   doI2cReadStep(i2c, data);
-  readWaterLevel(data);
+  readWaterLevel(water, data, settings);
 }
 
 void debuglog(char *str) {
@@ -396,6 +460,10 @@ void interpretSensors(struct SwampData data, struct SwampSettings settings, stru
     if(data.outside.temperature < data.inside.temperature - settings.temperature_swing) {
       sense->outside.temp = COOL;
       debuglog("outside became COOL");
+    }
+    if(data.outside.temperature > data.inside.temperature + settings.overheat) {
+      sense->outside.temp = OVERHEATED;
+      debuglog("outside became OVERHEATED");
     }
   }
 
@@ -470,13 +538,30 @@ void interpretSensors(struct SwampData data, struct SwampSettings settings, stru
     }
   }
 
-  // TODO: bang bang water levels
+  if(sense->reservoir != LOW_WATER && data.reservoir <= settings.min_reservoir_level) {
+    sense->reservoir = LOW_WATER;
+    debuglog("reservoir became LOW");
+  }
+  if(sense->reservoir == LOW_WATER && data.reservoir >= settings.min_reservoir_level + settings.reservoir_level_swing) {
+      sense->reservoir = ENOUGH_WATER;
+      debuglog("reservoir became ENOUGH");
+  }
+  if(sense->reservoir == ENOUGH_WATER && data.reservoir >= settings.max_reservoir_level) {
+    sense->reservoir = HIGH_WATER;
+    debuglog("reservoir became HIGH");
+  }
+  if(sense->reservoir == HIGH_WATER && sense->reservoir <= settings.max_reservoir_level - settings.reservoir_level_swing) {
+      sense->reservoir = ENOUGH_WATER;
+    debuglog("reservoir became ENOUGH");
+  }
+
+  sense->can_refill = settings.estimated_extra_water > 0;
 }
 
 void applyTruthTable(struct SwampSense sense, struct SwampAction *action) {
   if(   sense.inside.temp == HOT
      && sense.inside.hum  == WET
-     && sense.outside.temp == HOT) {
+     && (sense.outside.temp == HOT || sense.outside.temp == OVERHEATED)) {
     // overhumid. red/blue alert and shutdown.
     // this is the only state that overrides refills
     action->blower_fan = OFF;
@@ -489,7 +574,7 @@ void applyTruthTable(struct SwampSense sense, struct SwampAction *action) {
     return;
   }
 
-  if(sense.reservoir == LOW_WATER) {
+  if(sense.reservoir != HIGH_WATER && sense.can_refill) {
     // refill!
     action->refill_pump = ON;
     action->lights.refill = 1;
@@ -533,9 +618,13 @@ void applyTruthTable(struct SwampSense sense, struct SwampAction *action) {
     } else {
       // but it's usually better to blow wet
       action->lights.color1 = GREEN;
-      if(sense.reservoir == HIGH_WATER && sense.blower.hum == DRY) {
+      if(sense.blower.hum == DRY) {
         action->bilge_pump = ON;
-        action->lights.color2 = BLUE;
+        if(sense.reservoir != LOW_WATER) {
+          action->lights.color2 = BLUE;
+        } else {
+          action->lights.color2 = YELLOW;
+        }
       } else {
         action->bilge_pump = OFF;
         action->lights.color2 = 0;
@@ -547,29 +636,35 @@ void applyTruthTable(struct SwampSense sense, struct SwampAction *action) {
   // OK. It's hot out. Normal operation.
 
   if(sense.blower.temp == HOT) {
-    // but blowing hot air is no good
-    action->blower_fan = SLOW;
-    action->lights.alert = 1;
-
-    if(sense.blower.hum == WET) {
-      // blowing wet, hot air? Overheated!! add ice??
+    if(sense.outside.temp == OVERHEATED) {
       action->bilge_pump = OFF;
-      action->lights.alert = 1;
+      action->blower_fan = OFF;
       action->lights.color1 = RED;
-      action->lights.color2 = 0;
-      return;
+      action->lights.color2 = GREY;
     } else {
-      // blowing dry, hot air? Add water!
-      if(sense.reservoir == HIGH_WATER) {
-        // if we have water
-        action->bilge_pump = ON;
-        action->lights.color1 = BLUE;
-        action->lights.color2 = 0;
-      } else {
-        // well. maybe we can refill.
+      // maybe we're bootstrapping
+      action->blower_fan = ON;
+      // blowing hot air is a problem situation
+      action->lights.alert = 1;
+
+      if(sense.blower.hum == WET) {
+        // blowing wet, hot air? Overheated!! add ice??
         action->bilge_pump = OFF;
-        action->lights.color1 = YELLOW;
+        action->lights.alert = 1;
+        action->lights.color1 = RED;
         action->lights.color2 = 0;
+        return;
+      } else {
+        action->bilge_pump = ON;
+        action->lights.color1 = YELLOW;
+        // blowing dry, hot air? Add water!
+        if(sense.reservoir != LOW_WATER) {
+          // if we have water
+          action->lights.color2 = BLUE;
+        } else {
+          // well. dry but maybe we can refill.
+          action->lights.color2 = 0;
+        }
       }
     }
     return;
@@ -581,15 +676,19 @@ void applyTruthTable(struct SwampSense sense, struct SwampAction *action) {
 
   if(sense.blower.temp == COOL) {
     // Not quite cold. Might count as hot once the indoor temp drops a little.
-    action->lights.color1 = YELLOW;
+    action->lights.color1 = PINK;
   } else {
     action->lights.color1 = WHITE;
   }
 
-  if(sense.reservoir == HIGH_WATER && sense.blower.hum == DRY) {
+  if(sense.blower.hum == DRY) {
     // run water
     action->bilge_pump = ON;
-    action->lights.color2 = BLUE;
+    if(sense.reservoir != LOW_WATER) {
+      action->lights.color2 = BLUE;
+    } else {
+      action->lights.color2 = YELLOW;
+    }
   } else {
     action->bilge_pump = OFF;
     action->lights.color2 = 0;
@@ -606,22 +705,13 @@ void turnOffBlower(struct SwampPWM *pwm) {
 }
 
 void turnOnBlower(enum Power level, struct SwampSettings settings, struct SwampPWM *pwm) {
-  if(level == SLOW) {
+  if(level == ON && settings.blower_pwm) {
     #ifdef __EMSCRIPTEN__
-    EM_ASM({blower = $0;}, settings.blower_low_pwm);
+    EM_ASM({blower = $0;}, settings.blower_pwm);
     #else
-    if(pwm->pin[blowerPin] != settings.blower_low_pwm) {
-      analogWrite(blowerPin, settings.blower_low_pwm);
-      pwm->pin[blowerPin] = settings.blower_low_pwm;
-    }
-    #endif
-  } else if(level == ON) {
-    #ifdef __EMSCRIPTEN__
-    EM_ASM({blower = $0;}, settings.blower_high_pwm);
-    #else
-    if(pwm->pin[blowerPin] != settings.blower_high_pwm) {
-      analogWrite(blowerPin, settings.blower_high_pwm);
-      pwm->pin[blowerPin] = settings.blower_high_pwm;
+    if(pwm->pin[blowerPin] != settings.blower_pwm) {
+      analogWrite(blowerPin, settings.blower_pwm);
+      pwm->pin[blowerPin] = settings.blower_pwm;
     }
     #endif
   } else {
@@ -645,11 +735,12 @@ void turnOffBilgePump() {
   #endif
 }
 
-void turnOnRefillPump(struct SwampSettings settings) {
+void turnOnRefillPump() {
   #ifdef __EMSCRIPTEN__
-  EM_ASM({refill_pump = $0;}, settings.refill_pump_pwm);
+  EM_ASM({refill_pump = true});
   #else
-  analogWrite(refillPumpPin, settings.refill_pump_pwm);
+  Serial.println("turn on refill");
+  digitalWrite(refillPumpPin, HIGH);
   #endif
 }
 
@@ -657,6 +748,7 @@ void turnOffRefillPump() {
   #ifdef __EMSCRIPTEN__
   EM_ASM({refill_pump = false});
   #else
+  Serial.println("turn off refill");
   digitalWrite(refillPumpPin, LOW);
   #endif
 }
@@ -680,28 +772,11 @@ void takeAction(struct SwampAction action, struct SwampSettings settings, struct
   unsigned long now = millis();
 
   if(action.blower_fan == OFF){
-    timers->blower_start_time = 0;
-    if(! timers->blower_stop_time ){
-      timers->blower_stop_time = now;
-    }
-  } else {
-    if(!timers->blower_start_time && !timers->blower_stop_time) {
-      timers->blower_start_time = now;
-    }
-    if(action.blower_fan == ON) {
-      timers->blower_start_time = now;
-    } else { // action.blower_fan == SLOW
-      dutyCycle(now, &timers->blower_start_time, &timers->blower_stop_time,
-                settings.blower_low_run_time, settings.blower_low_wait_time);
-    }
-  }
-  if(timers->blower_start_time) {
-    turnOnBlower(action.blower_fan, settings, pwm);
-  } else {
     turnOffBlower(pwm);
+  } else {
+    turnOnBlower(action.blower_fan, settings, pwm);
   }
 
-  // TODO : bilge pump
   if(action.bilge_pump == OFF){
     timers->bilge_pump_start_time = 0;
     if(! timers->bilge_pump_stop_time){
@@ -721,7 +796,33 @@ void takeAction(struct SwampAction action, struct SwampSettings settings, struct
     turnOffBilgePump();
   }
 
-  // TODO: refill pump
+  if(action.refill_pump == ON) {
+    if(! timers->refill_start_time) {
+      turnOnRefillPump();
+      timers->refill_start_time = now;
+    }
+  } else {
+    turnOffRefillPump();
+    timers->refill_start_time = 0;
+  }
+}
+
+void estimateRefill(struct SwampSettings *settings, struct SwampTimers *timers) {
+  if(! timers->refill_start_time) { return; }
+  unsigned long now = millis();
+
+  long int timeUnit = 4 * settings->refill_pump_time_per_gallon;
+  if(timeUnit < 1) { timeUnit = 1; }
+  if(timers->refill_start_time + timeUnit <= now) {
+    timers->refill_start_time += timeUnit;
+    //Serial.println(settings->estimated_extra_water);
+    if(settings->estimated_extra_water > 0) {
+      settings->estimated_extra_water -= 1;
+      if(settings->estimated_extra_water % 16 == 0) {
+        writeEEPROM(settings);
+      }
+    }
+  }
 }
 
 void readButtons(struct SwampButtons *buttons) {
@@ -766,7 +867,7 @@ void readButtons(struct SwampButtons *buttons) {
 
 void writeEEPROM(struct SwampSettings *settings) {
 #ifdef __EMSCRIPTEN__
-  //TODO
+  //todo
 #else
   EEPROM.write(0, eepromVersion);
   char *ptr;
@@ -780,7 +881,7 @@ void writeEEPROM(struct SwampSettings *settings) {
 
 void readEEPROM(struct SwampSettings *settings) {
 #ifdef __EMSCRIPTEN__
-  //TODO
+  //todo
 #else
   char version;
   version = EEPROM.read(0);
@@ -800,13 +901,22 @@ void readEEPROM(struct SwampSettings *settings) {
 void doUI(struct SwampUI *ui, struct SwampButtons *buttons, struct SwampSettings *settings) {
   if(buttons->pressed) {
     if(buttons->pressed == leftButton) {
-      if(ui->selection > 0) { ui->selection -= 1; }
+      if(ui->selection >= extraSettingsSetting && ui->selection <= extraSettingsSetting4) {
+        ui->selection = extraSettingsSetting - 1;
+      } else {
+        if(ui->selection > 0) { ui->selection -= 1; }
+      }
     } else if(buttons->pressed == rightButton) {
-      if(ui->selection < maxSetting && ui->selection != extraSettingsSetting) {
-        ui->selection += 1;
+      if(ui->selection >= extraSettingsSetting && ui->selection <= extraSettingsSetting4) {
+        ui->selection = extraSettingsSetting;
+      } else {
+        if( ui->selection < maxSetting
+          ) {
+          ui->selection += 1;
+        }
       }
     } else { // up or down
-      if(ui->selection == extraWaterEstimateSetting) {
+      if(ui->selection == waterLevelsSetting) {
         if(buttons->pressed == upButton) {
           if(settings->estimated_extra_water < maxExtraWater - extraWaterStep) {
             settings->estimated_extra_water += extraWaterStep;
@@ -825,16 +935,15 @@ void doUI(struct SwampUI *ui, struct SwampButtons *buttons, struct SwampSettings
 
       if(ui->selection == blowerSpeedSetting) {
         if(buttons->pressed == upButton) {
-          if(settings->blower_high_pwm < maxBlowerSpeed) {
-            settings->blower_high_pwm += blowerSpeedStep;
+          if(settings->blower_pwm < maxBlowerSpeed) {
+            settings->blower_pwm += blowerSpeedStep;
           }
         }
         if(buttons->pressed == downButton) {
-          if(settings->blower_high_pwm > minBlowerSpeed) {
-            settings->blower_high_pwm -= blowerSpeedStep;
+          if(settings->blower_pwm > minBlowerSpeed) {
+            settings->blower_pwm -= blowerSpeedStep;
           }
         }
-        //analogWrite(blowerPin, settings->blower_high_pwm); // TODO: NO CHEATING
       }
 
       if(ui->selection == targetTemperatureSetting) {
@@ -863,15 +972,143 @@ void doUI(struct SwampUI *ui, struct SwampButtons *buttons, struct SwampSettings
         }
       }
 
-      if(ui->selection == extraSettingsSetting) {
+      if(ui->selection == minReservoirLevelSetting) {
         if(buttons->pressed == upButton) {
-          // TODO: passcode?
-          ui->selection += 1;
+          if(settings->min_reservoir_level < maxReservoirLevel) {
+            settings->min_reservoir_level += 1;
+          }
+        }
+        if(buttons->pressed == downButton) {
+          if(settings->min_reservoir_level > minReservoirLevel) {
+            settings->min_reservoir_level -= 1;
+          }
+        }
+      }
+
+      if(ui->selection == maxReservoirLevelSetting) {
+        if(buttons->pressed == upButton) {
+          if(settings->max_reservoir_level < maxReservoirLevel) {
+            settings->max_reservoir_level += 1;
+          }
+        }
+        if(buttons->pressed == downButton) {
+          if(settings->max_reservoir_level > minReservoirLevel) {
+            settings->max_reservoir_level -= 1;
+          }
+        }
+      }
+
+      if(ui->selection == currentReservoirLevelSetting) {
+        if(buttons->pressed == upButton) {
+          settings->water_level_calibrate_tenths_of_inches += 1;
+        }
+        if(buttons->pressed == downButton) {
+          settings->water_level_calibrate_tenths_of_inches -= 1;
         }
       }
 
       if(ui->selection == bilgePumpRunTimeSetting) {
-        // TODO
+        if(buttons->pressed == upButton) {
+          settings->bilge_pump_run_time += 5;
+        }
+        if(buttons->pressed == downButton) {
+          settings->bilge_pump_run_time -= 5;
+        }
+      }
+
+      if(ui->selection == bilgePumpWaitTimeSetting) {
+        if(buttons->pressed == upButton) {
+          settings->bilge_pump_wait_time += 5;
+        }
+        if(buttons->pressed == downButton) {
+          settings->bilge_pump_wait_time -= 5;
+        }
+      }
+
+      if(ui->selection == overheatSetting) {
+        if(buttons->pressed == upButton) {
+          settings->overheat += 1;
+        }
+        if(buttons->pressed == downButton) {
+          settings->overheat -= 1;
+        }
+      }
+
+      if(ui->selection == temperatureSwingSetting) {
+        if(buttons->pressed == upButton) {
+          settings->temperature_swing += 1;
+        }
+        if(buttons->pressed == downButton) {
+          settings->temperature_swing -= 1;
+        }
+      }
+
+      if(ui->selection == humiditySwingSetting) {
+        if(buttons->pressed == upButton) {
+          settings->target_humidity_swing += 1;
+        }
+        if(buttons->pressed == downButton) {
+          settings->target_humidity_swing -= 1;
+        }
+      }
+
+      if(ui->selection == maxHumiditySetting) {
+        if(buttons->pressed == upButton) {
+          settings->max_humidity += 1;
+        }
+        if(buttons->pressed == downButton) {
+          settings->max_humidity -= 1;
+        }
+      }
+
+      if(ui->selection == maxHumiditySwingSetting) {
+        if(buttons->pressed == upButton) {
+          settings->max_humidity_swing += 1;
+        }
+        if(buttons->pressed == downButton) {
+          settings->max_humidity_swing -= 1;
+        }
+      }
+
+      if(ui->selection == refillPumpTimePerGallonSetting) {
+        if(buttons->pressed == upButton) {
+          settings->refill_pump_time_per_gallon += 1;
+        }
+        if(buttons->pressed == downButton) {
+          settings->refill_pump_time_per_gallon -= 1;
+        }
+      }
+
+      if(ui->selection == factoryResetSetting) {
+        if(buttons->pressed == upButton) {
+          resetSettings(settings);
+          hi(); delay(1000);
+          ui->selection = 1;
+        }
+      }
+
+      if(ui->selection == extraSettingsSetting) {
+        if(buttons->pressed == upButton) {
+          ui->selection += 1;
+        }
+      } else if(ui->selection == extraSettingsSetting2) {
+        if(buttons->pressed == upButton) {
+          ui->selection += 1;
+        } else {
+          ui->selection = extraSettingsSetting;
+        }
+      } else if(ui->selection == extraSettingsSetting3) {
+        if(buttons->pressed == downButton) {
+          ui->selection += 1;
+        } else {
+          ui->selection = extraSettingsSetting;
+        }
+      } else if(ui->selection == extraSettingsSetting4) {
+        if(buttons->pressed == downButton) {
+          ui->selection += 1;
+        } else {
+          ui->selection = extraSettingsSetting;
+        }
       }
     }
 
@@ -886,12 +1123,12 @@ void doUI(struct SwampUI *ui, struct SwampButtons *buttons, struct SwampSettings
 
 void displayTemperatureAndHumidity(int temperature, int humidity, int sensorNumber) {
 #ifdef __EMSCRIPTEN__
-  // TODO
+  // todo
 #else
   matrix.writeDigitNum(0, temperature / 10);
   matrix.writeDigitNum(1, temperature % 10, sensorNumber != insideSensorNumber);
 
-  matrix.writeDigitRaw(2, 0);
+  matrix.writeDigitRaw(2, 2);
 
   matrix.writeDigitNum(3, humidity / 10);
   matrix.writeDigitNum(4, humidity % 10, sensorNumber != outsideSensorNumber);
@@ -900,9 +1137,37 @@ void displayTemperatureAndHumidity(int temperature, int humidity, int sensorNumb
 #endif
 }
 
+void resetSettings(struct SwampSettings *settings) {
+  settings->target_temperature = 67;
+  settings->temperature_swing = 5;
+  settings->overheat = 20;
+
+  settings->max_humidity = 80;
+  settings->max_humidity_swing = 15;
+
+  settings->target_humidity = 90;
+  settings->target_humidity_swing = 10;
+
+  settings->bilge_pump_run_time = 120;
+  settings->bilge_pump_wait_time = 180;
+
+  settings->estimated_extra_water = 7;
+
+  settings->blower_pwm = 255;
+
+  settings->min_reservoir_level = 20;
+  settings->max_reservoir_level = 100;
+  settings->reservoir_level_swing = 10;
+
+  settings->water_level_calibrate_ratio  = waterCalibrationInchRatio;
+  settings->water_level_calibrate_tenths_of_inches = waterCalibrationInch * 10;
+
+  settings->refill_pump_time_per_gallon = 45 * 60;
+}
+
 void displayH20() {
 #ifdef __EMSCRIPTEN__
-  // TODO
+  // todo
 #else
   // the water levels will be displayed on the neopixels
   // so we just show the word "H20" here
@@ -917,22 +1182,22 @@ void displayH20() {
 
 void displayFan(struct SwampSettings settings) {
 #ifdef __EMSCRIPTEN__
-  // TODO
+  // todo
 #else
   // "F xx"
   matrix.writeDigitNum(0, 0xF);
   matrix.writeDigitRaw(1, 0);
   matrix.writeDigitRaw(2, 0);
 
-  matrix.writeDigitNum(3, settings.blower_high_pwm / 16);
-  matrix.writeDigitNum(4, settings.blower_high_pwm % 16);
+  matrix.writeDigitNum(3, settings.blower_pwm / 16);
+  matrix.writeDigitNum(4, settings.blower_pwm % 16);
   matrix.writeDisplay();
 #endif
 }
 
 void displayTargetTemperature(struct SwampSettings settings) {
 #ifdef __EMSCRIPTEN__
-  // TODO
+  // todo
 #else
   // "dd&deg;F"
   matrix.writeDigitNum(0, settings.target_temperature / 10);
@@ -947,7 +1212,7 @@ void displayTargetTemperature(struct SwampSettings settings) {
 
 void displayTargetHumidity(struct SwampSettings settings) {
 #ifdef __EMSCRIPTEN__
-  // TODO
+  // todo
 #else
   // "% dd"
   matrix.writeDigitRaw(0, 1 + 2 + 32 + 64); // &deg;
@@ -962,7 +1227,7 @@ void displayTargetHumidity(struct SwampSettings settings) {
 
 void displayLock() {
 #ifdef __EMSCRIPTEN__
-  // TODO
+  // todo
 #else
   matrix.writeDigitNum(0, 5);
   matrix.writeDigitNum(1, 1);
@@ -973,9 +1238,205 @@ void displayLock() {
 #endif
 }
 
+void displayJes() {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitRaw(0, 0);
+  matrix.writeDigitRaw(1, 2 + 4 + 8);
+  matrix.writeDigitRaw(2, 0);
+  matrix.writeDigitNum(3, 0xE);
+  matrix.writeDigitRaw(4, 1 + 4 +  8 + 32 + 64);
+  matrix.writeDisplay();
+#endif
+}
+
+void displayAnna() {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitNum(0, 10, 0);
+  matrix.writeDigitRaw(1, 4 + 16 + 64);
+  matrix.writeDigitRaw(2, 0);
+  matrix.writeDigitRaw(3, 4 + 16 + 64);
+  matrix.writeDigitNum(4, 10, 0);
+  matrix.writeDisplay();
+#endif
+}
+
+void displayHaze() {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitRaw(0, 2 + 4 + 16 + 32 + 64);
+  matrix.writeDigitNum(1, 0xA);
+  matrix.writeDigitRaw(2, 0);
+  matrix.writeDigitNum(3, 2);
+  matrix.writeDigitNum(4, 0xE);
+  matrix.writeDisplay();
+#endif
+}
+
+void displayMinReservoirLevelSetting(struct SwampSettings settings) {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitRaw(0, 2 + 4 + 8 + 16 + 32);
+  matrix.writeDigitNum(1, settings.min_reservoir_level / 100);
+  matrix.writeDigitRaw(2, 0);
+  matrix.writeDigitNum(3, settings.min_reservoir_level / 10 % 10, true);
+  matrix.writeDigitNum(4, settings.min_reservoir_level % 10);
+  matrix.writeDisplay();
+#endif
+}
+
+void displayMaxReservoirLevelSetting(struct SwampSettings settings) {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitRaw(0, 1 + 2 + 4 + 16 + 32);
+  matrix.writeDigitNum(1, settings.max_reservoir_level / 100);
+  matrix.writeDigitRaw(2, 0);
+  matrix.writeDigitNum(3, settings.max_reservoir_level / 10 % 10, true);
+  matrix.writeDigitNum(4, settings.max_reservoir_level % 10);
+  matrix.writeDisplay();
+#endif
+}
+
+void displayCurrentReservoirLevelSetting(struct SwampData data) {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitRaw(0, 2 + 4 + 16 + 32 + 64);
+  matrix.writeDigitRaw(1, 0);
+  matrix.writeDigitRaw(2, 0);
+  matrix.writeDigitNum(3, data.reservoir / 10, true);
+  matrix.writeDigitNum(4, data.reservoir % 10);
+  matrix.writeDisplay();
+#endif
+}
+
+
+void displayBilgePumpRunTimeSetting(struct SwampSettings settings) {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitNum(0, 0xb, true);
+  matrix.writeDigitNum(1, settings.bilge_pump_run_time / 60);
+  matrix.writeDigitRaw(2, 2);
+  matrix.writeDigitNum(3, (settings.bilge_pump_run_time % 60) / 10);
+  matrix.writeDigitNum(4, settings.bilge_pump_run_time % 10);
+  matrix.writeDisplay();
+#endif
+}
+
+void displayBilgePumpWaitTimeSetting(struct SwampSettings settings) {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitNum(0, 0xb, true);
+  matrix.writeDigitNum(1, settings.bilge_pump_wait_time / 60);
+  matrix.writeDigitRaw(2, 2);
+  matrix.writeDigitNum(3, (settings.bilge_pump_wait_time % 60) / 10);
+  matrix.writeDigitNum(4, settings.bilge_pump_wait_time % 10, true);
+  matrix.writeDisplay();
+#endif
+}
+
+void displayOverheatSetting(struct SwampSettings settings) {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitRaw(0, 1);
+  matrix.writeDigitNum(1, settings.overheat / 10);
+  matrix.writeDigitRaw(2, 0);
+  matrix.writeDigitNum(3, settings.overheat % 10);
+  matrix.writeDigitRaw(4, 1 + 2 + 32 + 64);
+  matrix.writeDisplay();
+#endif
+}
+
+void displayTemperatureSwingSetting(struct SwampSettings settings) {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitRaw(0, 8 + 64);
+  matrix.writeDigitNum(1, settings.temperature_swing / 10);
+  matrix.writeDigitRaw(2, 0);
+  matrix.writeDigitNum(3, settings.temperature_swing % 10);
+  matrix.writeDigitRaw(4, 1 + 2 + 32 + 64);
+  matrix.writeDisplay();
+#endif
+}
+
+void displayHumiditySwingSetting(struct SwampSettings settings) {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitRaw(0, 1 + 2 + 32 + 64); // &deg;
+  matrix.writeDigitRaw(1, 4 + 8 + 16 + 64); // o
+  matrix.writeDigitRaw(2, 2);
+  matrix.writeDigitNum(3, settings.target_humidity_swing / 10);
+  matrix.writeDigitNum(4, settings.target_humidity_swing % 10);
+  matrix.writeDisplay();
+#endif
+}
+
+void displayMaxHumiditySetting(struct SwampSettings settings) {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitRaw(0, 1 + 2 + 32 + 64 + 128); // &deg;
+  matrix.writeDigitRaw(1, 4 + 8 + 16 + 64 + 128); // o
+  matrix.writeDigitRaw(2, 0);
+  matrix.writeDigitNum(3, settings.max_humidity / 10, true);
+  matrix.writeDigitNum(4, settings.max_humidity % 10, true);
+  matrix.writeDisplay();
+#endif
+}
+
+void displayMaxHumiditySwingSetting(struct SwampSettings settings) {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitRaw(0, 1 + 2 + 32 + 64 + 128); // &deg;
+  matrix.writeDigitRaw(1, 4 + 8 + 16 + 64 + 128); // o
+  matrix.writeDigitRaw(2, 2);
+  matrix.writeDigitNum(3, settings.max_humidity_swing / 10, true);
+  matrix.writeDigitNum(4, settings.max_humidity_swing % 10, true);
+  matrix.writeDisplay();
+#endif
+}
+
+void displayRefillPumpTimePerGallonSetting(struct SwampSettings settings) {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitNum(0, settings.refill_pump_time_per_gallon / 60 / 10);
+  matrix.writeDigitNum(1, settings.refill_pump_time_per_gallon / 60 % 10);
+  matrix.writeDigitRaw(2, 2);
+  matrix.writeDigitRaw(3, 16 + 64); // r
+  matrix.writeDigitNum(4, 0xf, true); // f
+  matrix.writeDisplay();
+#endif
+}
+
+void displayFactoryReset() {
+#ifdef __EMSCRIPTEN__
+  // todo
+#else
+  matrix.writeDigitNum(0, 0xF);
+  matrix.writeDigitNum(1, 0xA);
+  matrix.writeDigitRaw(2, 0);
+  matrix.writeDigitNum(3, 0xC);
+  matrix.writeDigitRaw(4, 0);
+  matrix.writeDisplay();
+#endif
+}
+
 void displayErr() {
 #ifdef __EMSCRIPTEN__
-  // TODO
+  // todo
 #else
   matrix.writeDigitRaw(0, 1 + 8 + 16 + 32 + 64); // E
   matrix.writeDigitRaw(1, 16 + 64); // r
@@ -998,22 +1459,74 @@ void display(struct SwampUI ui, struct SwampI2C i2c, struct SwampData data, stru
     struct SensorData *sensor_data = getSensorNumber(displaySensorNumber, &data);
     displayTemperatureAndHumidity(sensor_data->temperature, sensor_data->humidity, displaySensorNumber);
   } else {
-    // TODO display / edit settings
+    // display / edit settings
     switch(ui.selection) {
-      case extraWaterEstimateSetting: displayH20(); break;
+      case waterLevelsSetting: displayH20(); break;
       case blowerSpeedSetting: displayFan(settings); break;
       case targetTemperatureSetting: displayTargetTemperature(settings); break;
       case targetHumiditySetting: displayTargetHumidity(settings); break;
       case extraSettingsSetting: displayLock(); break;
+      case extraSettingsSetting2: displayJes(); break;
+      case extraSettingsSetting3: displayAnna(); break;
+      case extraSettingsSetting4: displayHaze(); break;
+      case minReservoirLevelSetting: displayMinReservoirLevelSetting(settings); break;
+      case maxReservoirLevelSetting: displayMaxReservoirLevelSetting(settings); break;
+      case currentReservoirLevelSetting: displayCurrentReservoirLevelSetting(data); break;
+      case bilgePumpRunTimeSetting: displayBilgePumpRunTimeSetting(settings); break;
+      case bilgePumpWaitTimeSetting: displayBilgePumpWaitTimeSetting(settings); break;
+      case overheatSetting: displayOverheatSetting(settings); break;
+      case temperatureSwingSetting: displayTemperatureSwingSetting(settings); break;
+      case humiditySwingSetting: displayHumiditySwingSetting(settings); break;
+      case maxHumiditySetting: displayMaxHumiditySetting(settings); break;
+      case maxHumiditySwingSetting: displayMaxHumiditySwingSetting(settings); break;
+      case refillPumpTimePerGallonSetting: displayRefillPumpTimePerGallonSetting(settings); break;
+      case factoryResetSetting: displayFactoryReset(); break;
       default: displayErr();
     }
   }
 }
 
-void animate(struct Animation lights) {
+void reservoirLED(struct SwampSettings settings) {
+  int r1, g1, b1, w1;
+  int i;
+  if(settings.estimated_extra_water == maxExtraWater) {
+    r1 = LIGHTCYAN / 0x1000 % 0x10;
+    g1 = LIGHTCYAN / 0x0100 % 0x10;
+    b1 = LIGHTCYAN / 0x0010 % 0x10;
+    w1 = LIGHTCYAN / 0x0001 % 0x10;
+    for(i = 0; i < 7; i++) {
+      #ifndef __EMSCRIPTEN__
+      strip.setPixelColor( (pixelCount + bottomPixel - 1 - i) % pixelCount, r1, g1, b1, w1);
+      #endif
+    }
+  } else {
+    int extraWaterLightCount = (7 * settings.estimated_extra_water) / (maxExtraWater - extraWaterStep);
+    r1 = BABYBLUE / 0x1000 % 0x10;
+    g1 = BABYBLUE / 0x0100 % 0x10;
+    b1 = BABYBLUE / 0x0010 % 0x10;
+    w1 = BABYBLUE / 0x0001 % 0x10;
+    for(i = 0; i < extraWaterLightCount; i++) {
+      #ifndef __EMSCRIPTEN__
+      strip.setPixelColor( (pixelCount + bottomPixel - 1 - i) % pixelCount, r1, g1, b1, w1);
+      #endif
+    }
+    r1 = BLUE / 0x1000 % 0x10;
+    g1 = BLUE / 0x0100 % 0x10;
+    b1 = BLUE / 0x0010 % 0x10;
+    w1 = BLUE / 0x0001 % 0x10;
+    if( ((14 * settings.estimated_extra_water) / (maxExtraWater - extraWaterStep)) % 2) {
+      #ifndef __EMSCRIPTEN__
+      strip.setPixelColor( (pixelCount + bottomPixel - 1 - extraWaterLightCount) % pixelCount, r1, g1, b1, w1);
+      #endif
+    }
+    // Serial.println(14 * settings.estimated_extra_water / maxExtraWater);
+  }
+}
+
+
+void animate(struct Animation lights, struct SwampSettings settings) {
   int r1, g1, b1, w1, r2, b2, g2, w2;
 
-  // TODO override animation with H20 setting
   r1 = lights.color1 / 0x1000 % 0x10;
   g1 = lights.color1 / 0x0100 % 0x10;
   b1 = lights.color1 / 0x0010 % 0x10;
@@ -1063,17 +1576,67 @@ void animate(struct Animation lights) {
     }
   }
 
-  // TODO set refill pixels to cyan if refill
+  // show extra water level/timer if refilling
+  if(lights.refill) {
+    //int r3, g3, b3, w3;
+    //r3 = LIGHTCYAN / 0x1000 % 0x10;
+    //g3 = LIGHTCYAN / 0x0100 % 0x10;
+    //b3 = LIGHTCYAN / 0x0010 % 0x10;
+    //w3 = LIGHTCYAN / 0x0001 % 0x10;
+    //#ifndef __EMSCRIPTEN__
+    //for(int p = refillStartPixel; p <= refillStopPixel; p++) {
+    //  strip.setPixelColor(p, r3, g3, b3, w3);
+    //}
+    //#endif
+    reservoirLED(settings);
+  }
 
   #ifndef __EMSCRIPTEN__
   strip.show();
   #endif
 }
 
+void waterLED(struct SwampSettings settings, struct SwampData data) {
+  int i;
+  for(i = 0; i < pixelCount; i++) {
+    #ifndef __EMSCRIPTEN__
+    strip.setPixelColor(i, 0, 0, 0, 0);
+    #endif
+  }
+
+  int r2, b2, g2, w2;
+
+  reservoirLED(settings);
+
+  r2 = CYAN / 0x1000 % 0x10;
+  g2 = CYAN / 0x0100 % 0x10;
+  b2 = CYAN / 0x0010 % 0x10;
+  w2 = CYAN / 0x0001 % 0x10;
+  int reservoirLightCount = (7 * data.reservoir) / settings.max_reservoir_level;
+  if(reservoirLightCount > 8) {reservoirLightCount = 8;}
+  for(i = 0; i < reservoirLightCount; i++) {
+    #ifndef __EMSCRIPTEN__
+    strip.setPixelColor( (bottomPixel + 1 + i) % pixelCount, r2, g2, b2, w2);
+    #endif
+  }
+
+  #ifndef __EMSCRIPTEN__
+  strip.show();
+  #endif
+}
+
+void doLights(struct Animation lights, struct SwampUI ui, struct SwampSettings settings, struct SwampData data) {
+  if(ui.selection == waterLevelsSetting) {
+    waterLED(settings, data);
+  } else {
+    animate(lights, settings);
+  }
+}
 
 struct SwampData data;
 struct SwampI2C i2c;
 struct SwampPWM pwm;
+struct SwampWater water;
 struct SwampUI ui;
 struct SwampSettings settings;
 struct SwampSense sense;
@@ -1132,57 +1695,31 @@ void setup() {
     pwm.pin[pin] = 0;
   }
 
-  settings.target_temperature = 67;
-  settings.temperature_swing = 5;
-
-  settings.max_humidity = 80;
-  settings.max_humidity_swing = 20;
-
-  settings.target_humidity = 90;
-  settings.target_humidity_swing = 10;
-
-  settings.bilge_pump_run_time = 120;
-  settings.bilge_pump_wait_time = 120;
-
-  settings.estimated_extra_water = 0;
-
-  settings.blower_high_pwm = 255;
-  //settings.blower_high_run_time = 30;
-  //settings.blower_high_wait_time = 0;
-
-  settings.blower_low_pwm = 127; // TODO: find a reasonable slow speed
-  settings.blower_low_run_time = 15;
-  settings.blower_low_wait_time = 60;
-
-  settings.min_reservoir_level = 10;
-  settings.max_reservoir_level = 70;
-
-  settings.refill_pump_pwm = 255;
-  settings.refill_pump_time_per_tenth_of_an_inch = 10;
-
-  timers.blower_start_time = 0;
-  timers.blower_stop_time = 0;
+  water.readingCount = 0;
+  water.readingIndex = 0;
 
   buttons.pressed = 0;
 
+  resetSettings(&settings);
   readEEPROM(&settings);
 }
 
 void simulate() {
   #ifdef __EMSCRIPTEN__
-  EM_ASM({simulate();});
+  EM_ASM({simulate();(});
   #endif
 }
 
 void loop() {
-  readSensors(&i2c, &data);
+  readSensors(&i2c, &data, &water, settings);
   interpretSensors(data, settings, &sense);
   applyTruthTable(sense, &action);
   takeAction(action, settings, &timers, &pwm);
+  estimateRefill(&settings, &timers);
   readButtons(&buttons);
   doUI(&ui, &buttons, &settings);
   display(ui, i2c, data, settings);
-  animate(action.lights);
+  doLights(action.lights, ui, settings, data);
   simulate();
 }
 
