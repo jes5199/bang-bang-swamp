@@ -1,4 +1,6 @@
-#define eepromVersion 11
+// Select "Arduino/Genuino Uno" in the Arduino IDE
+
+#define eepromVersion 13
 
 #define waterLevelPin A1
 #define waterLevelCalibrationPin A2
@@ -1072,10 +1074,10 @@ void doUI(struct SwampUI *ui, struct SwampButtons *buttons, struct SwampSettings
 
       if(ui->selection == refillPumpTimePerGallonSetting) {
         if(buttons->pressed == upButton) {
-          settings->refill_pump_time_per_gallon += 1;
+          settings->refill_pump_time_per_gallon += 60;
         }
         if(buttons->pressed == downButton) {
-          settings->refill_pump_time_per_gallon -= 1;
+          settings->refill_pump_time_per_gallon -= 60;
         }
       }
 
@@ -1151,7 +1153,7 @@ void resetSettings(struct SwampSettings *settings) {
   settings->bilge_pump_run_time = 120;
   settings->bilge_pump_wait_time = 180;
 
-  settings->estimated_extra_water = 7;
+  settings->estimated_extra_water = 0;
 
   settings->blower_pwm = 255;
 
